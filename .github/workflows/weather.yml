@@ -1,0 +1,36 @@
+name: Pogoda dla Kindle
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # co godzine, 7 minut po pelnej
+  workflow_dispatch:       # pozwala uruchomic recznie
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalacja zaleznosci
+        run: |
+          pip install pillow
+          sudo apt-get update
+          sudo apt-get install -y fonts-dejavu-core
+
+      - name: Generowanie obrazu
+        run: python weather.py
+
+      - name: Zapis obrazu w repozytorium
+        run: |
+          git config user.name "weather-bot"
+          git config user.email "weather-bot@users.noreply.github.com"
+          git add weather.png
+          git commit -m "Aktualizacja pogody" || exit 0
+          git push
