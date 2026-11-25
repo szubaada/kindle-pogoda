@@ -16,6 +16,12 @@ from PIL import Image, ImageDraw, ImageFont
 CITY = "Warszawa"
 LAT, LON = 52.2297, 21.0122
 TZ = "Europe/Warsaw"
+
+# Przedzialy dnia: (nazwa, od godziny, do godziny - bez tej godziny).
+# Mozesz je zmienic, np. ("Rano", 5, 9), jesli wstajesz wczesniej.
+PERIODS = [("Rano", 6, 10), ("Południe", 10, 14), ("Popołudnie", 14, 18), ("Wieczór", 18, 22)]
+# Po tej godzinie pokazujemy przebieg jutrzejszego dnia zamiast dzisiejszego.
+SWITCH_TO_TOMORROW_AT = 21
 # =============================================
 
 W, H = 1072, 1448
@@ -53,10 +59,12 @@ def fetch():
     params = (
         f"latitude={LAT}&longitude={LON}"
         "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
-        "weather_code,wind_speed_10m"
+        "weather_code,wind_speed_10m,pressure_msl"
         "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
         "precipitation_probability_max,sunrise,sunset"
-        f"&timezone={urllib.parse.quote(TZ, safe='')}&forecast_days=5&wind_speed_unit=kmh"
+        "&hourly=temperature_2m,weather_code,precipitation_probability,pressure_msl"
+        f"&timezone={urllib.parse.quote(TZ, safe='')}&past_days=1&forecast_days=5"
+        "&wind_speed_unit=kmh"
     )
     url = "https://api.open-meteo.com/v1/forecast?" + params
     with urllib.request.urlopen(url, timeout=30) as r:
@@ -117,11 +125,76 @@ def icon(d, kind, cx, cy, s):
             d.line([cx - 0.5 * s, y, cx + 0.5 * s, y], fill=0, width=max(3, int(0.06 * s)))
 
 
-# ---------- render ----------
+# ---------- pomocnicze ----------
 
 def hhmm(iso):
     return iso[11:16]
 
+
+def severity(code):
+    """Im wyzsza wartosc, tym 'gorsza' pogoda (do wyboru ikony przedzialu)."""
+    if code is None:
+        return -1
+    if code in (0, 1):
+        return code
+    if code == 2:
+        return 2
+    if code == 3:
+        return 3
+    if code in (45, 48):
+        return 4
+    if 51 <= code <= 57:
+        return 5
+    if 61 <= code <= 67 or 80 <= code <= 82:
+        return 6
+    if 71 <= code <= 77 or code in (85, 86):
+        return 7
+    return 8  # burze
+
+
+def pressure_trend(data, now):
+    """Zwraca (cisnienie, delta_3h, opis, symbol)."""
+    cur = data["current"].get("pressure_msl")
+    if cur is None:
+        return None, None, "brak danych", "?"
+    times = data["hourly"]["time"]
+    key = (now - dt.timedelta(hours=3)).strftime("%Y-%m-%dT%H:00")
+    delta = None
+    if key in times:
+        old = data["hourly"]["pressure_msl"][times.index(key)]
+        if old is not None:
+            delta = cur - old
+    if delta is None:
+        return cur, None, "brak trendu", "→"
+    if delta >= 1.0:
+        return cur, delta, "rośnie", "↗"
+    if delta <= -1.0:
+        return cur, delta, "spada", "↘"
+    return cur, delta, "stabilne", "→"
+
+
+def day_period(data, date_str, start, end):
+    """Zwraca (srednia temp, max prawdop. opadow, kod pogody) dla przedzialu godzin."""
+    h = data["hourly"]
+    temps, probs, codes = [], [], []
+    for hour in range(start, end):
+        key = f"{date_str}T{hour:02d}:00"
+        if key not in h["time"]:
+            continue
+        i = h["time"].index(key)
+        if h["temperature_2m"][i] is not None:
+            temps.append(h["temperature_2m"][i])
+        if h["precipitation_probability"][i] is not None:
+            probs.append(h["precipitation_probability"][i])
+        if h["weather_code"][i] is not None:
+            codes.append(h["weather_code"][i])
+    temp = sum(temps) / len(temps) if temps else None
+    prob = max(probs) if probs else None
+    code = max(codes, key=severity) if codes else None
+    return temp, prob, code
+
+
+# ---------- render ----------
 
 def render(data):
     now = dt.datetime.now(ZoneInfo(TZ))
@@ -131,44 +204,86 @@ def render(data):
     d = ImageDraw.Draw(img)
     f = lambda path, size: ImageFont.truetype(path, size)
 
-    # nagłówek
-    d.text((W // 2, 85), CITY, font=f(FONT_B, 70), fill=0, anchor="mm")
+    # --- naglowek ---
+    d.text((W // 2, 62), CITY, font=f(FONT_B, 64), fill=0, anchor="mm")
     date_txt = f"{DAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]}"
-    d.text((W // 2, 160), date_txt, font=f(FONT, 42), fill=0, anchor="mm")
-    d.line([60, 210, W - 60, 210], fill=0, width=4)
+    d.text((W // 2, 128), date_txt, font=f(FONT, 38), fill=0, anchor="mm")
+    d.line([60, 170, W - 60, 170], fill=0, width=4)
 
-    # aktualna pogoda
+    # --- aktualna pogoda ---
     desc, kind = info(cur["weather_code"])
-    icon(d, kind, 280, 455, 320)
-    d.text((520, 410), f"{round(cur['temperature_2m'])}°", font=f(FONT_B, 230),
+    icon(d, kind, 235, 340, 245)
+    d.text((440, 325), f"{round(cur['temperature_2m'])}°", font=f(FONT_B, 200),
            fill=0, anchor="lm")
-    d.text((W // 2, 640), desc, font=f(FONT_B, 56), fill=0, anchor="mm")
+    d.text((W // 2, 490), desc, font=f(FONT_B, 50), fill=0, anchor="mm")
     details = (f"Odczuwalna {round(cur['apparent_temperature'])}°  ·  "
                f"Wilgotność {round(cur['relative_humidity_2m'])}%  ·  "
                f"Wiatr {round(cur['wind_speed_10m'])} km/h")
-    d.text((W // 2, 720), details, font=f(FONT, 34), fill=0, anchor="mm")
-    sun_txt = f"Wschód {hhmm(daily['sunrise'][0])}   ·   Zachód {hhmm(daily['sunset'][0])}"
-    d.text((W // 2, 780), sun_txt, font=f(FONT, 34), fill=0, anchor="mm")
-    d.line([60, 840, W - 60, 840], fill=0, width=4)
+    d.text((W // 2, 548), details, font=f(FONT, 32), fill=0, anchor="mm")
 
-    # prognoza na 4 kolejne dni
-    y0, row = 850, 130
-    for i in range(1, 5):
-        yc = y0 + (i - 1) * row + row // 2
+    p, delta, p_word, p_sym = pressure_trend(data, now)
+    if p is not None:
+        p_txt = f"Ciśnienie {round(p)} hPa   {p_sym} {p_word}"
+        if delta is not None:
+            dr = round(delta)
+            sign = "+" if dr > 0 else ("−" if dr < 0 else "")
+            p_txt += f" ({sign}{abs(dr)} hPa / 3 h)"
+    else:
+        p_txt = "Ciśnienie: brak danych"
+    d.text((W // 2, 602), p_txt, font=f(FONT_B, 36), fill=0, anchor="mm")
+
+    pi = daily["time"].index(now.strftime("%Y-%m-%d"))
+    sun_txt = f"Wschód {hhmm(daily['sunrise'][pi])}   ·   Zachód {hhmm(daily['sunset'][pi])}"
+    d.text((W // 2, 656), sun_txt, font=f(FONT, 32), fill=0, anchor="mm")
+    d.line([60, 700, W - 60, 700], fill=0, width=4)
+
+    # --- przebieg dnia (rano / poludnie / popoludnie / wieczor) ---
+    if now.hour >= SWITCH_TO_TOMORROW_AT:
+        target = now.date() + dt.timedelta(days=1)
+        title = "Jutro w ciągu dnia"
+    else:
+        target = now.date()
+        title = "Dziś w ciągu dnia"
+    d.text((60, 740), title, font=f(FONT_B, 38), fill=0, anchor="lm")
+
+    col_w = (W - 120) / len(PERIODS)
+    for n, (name, start, end) in enumerate(PERIODS):
+        cx = int(60 + col_w * n + col_w / 2)
+        temp, prob, code = day_period(data, target.isoformat(), start, end)
+        d.text((cx, 800), name, font=f(FONT_B, 34), fill=0, anchor="mm")
+        d.text((cx, 838), f"{start}–{end}", font=f(FONT, 28), fill=90, anchor="mm")
+        icon(d, info(code)[1], cx, 925, 105)
+        t_txt = f"{round(temp)}°" if temp is not None else "-"
+        d.text((cx, 1012), t_txt, font=f(FONT_B, 50), fill=0, anchor="mm")
+        r_txt = f"opady {round(prob)}%" if prob is not None else "opady -"
+        d.text((cx, 1062), r_txt, font=f(FONT, 28), fill=0, anchor="mm")
+        if n:
+            x = int(60 + col_w * n)
+            d.line([x, 780, x, 1085], fill=170, width=2)
+    d.line([60, 1110, W - 60, 1110], fill=0, width=4)
+
+    # --- kolejne 3 dni ---
+    t_idx = daily["time"].index(target.isoformat())
+    y0, row = 1118, 92
+    for k in range(1, 4):
+        i = t_idx + k
+        if i >= len(daily["time"]):
+            break
+        yc = y0 + (k - 1) * row + row // 2
         day = dt.date.fromisoformat(daily["time"][i])
-        _, k = info(daily["weather_code"][i])
-        d.text((60, yc), DAYS[day.weekday()], font=f(FONT_B, 40), fill=0, anchor="lm")
-        icon(d, k, 480, yc, 100)
+        _, ik = info(daily["weather_code"][i])
+        d.text((60, yc), DAYS[day.weekday()], font=f(FONT_B, 38), fill=0, anchor="lm")
+        icon(d, ik, 470, yc, 70)
         tmax = round(daily["temperature_2m_max"][i])
         tmin = round(daily["temperature_2m_min"][i])
-        d.text((610, yc), f"{tmax}° / {tmin}°", font=f(FONT_B, 46), fill=0, anchor="lm")
-        p = daily["precipitation_probability_max"][i]
-        p_txt = f"{round(p)}%" if p is not None else "-"
-        d.text((W - 60, yc), p_txt, font=f(FONT, 40), fill=0, anchor="rm")
-        if i < 4:
-            d.line([60, y0 + i * row, W - 60, y0 + i * row], fill=128, width=2)
+        d.text((600, yc), f"{tmax}° / {tmin}°", font=f(FONT_B, 44), fill=0, anchor="lm")
+        pr = daily["precipitation_probability_max"][i]
+        d.text((W - 60, yc), f"{round(pr)}%" if pr is not None else "-",
+               font=f(FONT, 38), fill=0, anchor="rm")
+        if k < 3:
+            d.line([60, y0 + k * row, W - 60, y0 + k * row], fill=150, width=2)
 
-    d.text((W // 2, 1420), f"Aktualizacja: {now:%H:%M}", font=f(FONT, 28),
+    d.text((W // 2, 1425), f"Aktualizacja: {now:%H:%M}", font=f(FONT, 26),
            fill=90, anchor="mm")
 
     img.save(OUT)  # 8-bit skala szarosci, bez kanalu alfa
